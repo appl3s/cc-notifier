@@ -337,6 +337,7 @@ def send_ios_push_notification(title: str, message: str) -> None:
             "body": formatted_message,
             "sound": "default",
             "group": "ClaudeCode",
+            "url": "paseo://",
         }
         payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
