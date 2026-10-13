@@ -4,15 +4,31 @@ CC-notifier: Claude Code 事件通知器
 用于接收 Claude Code 的 hook 事件并发送到飞书和 iOS（通过 Bark）
 """
 import json
+import secrets
 import sys
 import os
 import requests
-import urllib.parse
 import re
 from datetime import datetime
 from typing import Dict, Any, Optional
 from pathlib import Path
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+import base64
 
+def aes128_cbc_encrypt(plaintext: bytes, key: bytes, iv: bytes) -> str:
+    if len(key) != 16:
+        raise ValueError("key 必须16字节(AES128)")
+    if len(iv) != 16:
+        raise ValueError("iv 必须16字节")
+
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    enc = cipher.encryptor()
+    cipher_bytes = enc.update(padded) + enc.finalize()
+    return base64.b64encode(cipher_bytes).decode()
 
 def load_config() -> Dict[str, Any]:
     """
@@ -61,6 +77,7 @@ def load_config() -> Dict[str, Any]:
 CONFIG = load_config()
 WEBHOOK_URL = CONFIG["feishu_webhook_url"]
 IOS_PUSH_URL = CONFIG["ios_push_url"]
+IOS_PUSH_MSG_KEY = CONFIG["ios_push_msg_key"]
 IOS_PUSH_ENABLED = CONFIG["ios_push_enabled"]
 
 
@@ -295,43 +312,55 @@ def format_notification_message(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def send_ios_push_notification(title: str, message: str) -> None:
     """
-    发送 iOS 推送通知（通过 Bark）
-    
-    Bark 是一个 iOS 推送服务，支持通过简单的 HTTP 请求发送通知
+    发送 iOS 推送通知（通过 Bark，使用 AES-128-CBC 加密）
+
+    Bark 加密推送协议：
+    - payload 为 JSON，包含 body/title/sound/group 等字段
+    - 使用 AES-128-CBC 加密（key 在 App 端配置，不随请求发送）
+    - iv 随机生成，随请求发送
+    - POST ciphertext(base64) 和 iv 到 {base_url}/{deviceKey}
     """
     if not IOS_PUSH_ENABLED or not IOS_PUSH_URL:
         return
-    
+
     try:
         # 清理标题中的 emoji，避免重复
         clean_title = re.sub(r'[🚨⏸️❌✅🤖🔧📢🛑🚀📝⚠️ℹ️]', '', title).strip()
-        
+
         # 格式化标题和消息
         formatted_title = f"🤖 {clean_title}"
         formatted_message = f"{message}\n\n{datetime.now().strftime('%H:%M:%S')}"
-        
-        # URL 编码
-        encoded_title = urllib.parse.quote(formatted_title)
-        encoded_message = urllib.parse.quote(formatted_message)
-        
-        # 构建 Bark URL
-        if IOS_PUSH_URL.startswith('http'):
-            # 完整的 URL
-            base_url = IOS_PUSH_URL.rstrip('/')
-            url = f"{base_url}/{encoded_title}/{encoded_message}"
-        else:
-            # 只提供了 key，构建完整 URL
-            url = f"https://api.day.app/{IOS_PUSH_URL}/{encoded_title}/{encoded_message}"
-        
-        # 添加参数
-        params = {
-            "sound": "default",     # 默认提示音
-            "group": "ClaudeCode"   # 通知分组
+
+        # 构造 Bark payload（JSON），所有可读字段都将被加密
+        payload = {
+            "title": formatted_title,
+            "body": formatted_message,
+            "sound": "default",
+            "group": "ClaudeCode",
         }
-        
-        # 发送请求
-        response = requests.get(url, params=params, timeout=10)
-        
+        payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        # 加密参数：key 在 App 端配置（16 字节），iv 随机生成（16 字节）
+        key = IOS_PUSH_MSG_KEY.encode("utf-8")
+        iv_str = secrets.token_hex(8)          # 16 个 hex 字符 = 16 字节
+        iv = iv_str.encode("utf-8")
+
+        # AES-128-CBC 加密 + base64
+        ciphertext = aes128_cbc_encrypt(payload_bytes, key, iv)
+
+        # 构建 Bark endpoint（IOS_PUSH_URL 已是 {base_url}/{deviceKey} 形式）
+        if IOS_PUSH_URL.startswith('http'):
+            url = IOS_PUSH_URL.rstrip('/')
+        else:
+            # 只提供了 deviceKey，构建完整 URL
+            url = f"https://api.day.app/{IOS_PUSH_URL}"
+
+        # POST ciphertext 和 iv（等价于官方 curl --data-urlencode）
+        response = requests.post(url, data={
+            "ciphertext": ciphertext,
+            "iv": iv_str,
+        }, timeout=10)
+
         # 检查响应
         if response.status_code != 200:
             print(f"iOS 推送失败：{response.text}", file=sys.stderr)
@@ -339,7 +368,7 @@ def send_ios_push_notification(title: str, message: str) -> None:
             result = response.json()
             if result.get('code') != 200:
                 print(f"iOS 推送失败：{result.get('message', '未知错误')}", file=sys.stderr)
-                
+
     except Exception as e:
         print(f"iOS 推送异常：{e}", file=sys.stderr)
 
