@@ -400,22 +400,22 @@ def main():
     try:
         # 从标准输入读取 hook 数据
         hook_data = json.load(sys.stdin)
-        
-        # 获取事件类型
-        event_type = hook_data.get("event_type", "Unknown")
-        
+
+        # 获取事件类型（Claude Code 实际字段是 hook_event_name）
+        event_type = hook_data.get("event_type") or hook_data.get("hook_event_name") or "Unknown"
+
         # 如果没有明确的事件类型，尝试从数据结构推断
         if event_type == "Unknown":
             if "stop_hook_active" in hook_data:
                 event_type = "Stop"
             elif "notification" in hook_data or "message" in hook_data:
                 event_type = "Notification"
-        
+
         # 处理不同的事件类型
         if event_type == "Stop":
             # 处理会话结束事件
             message = format_stop_message(hook_data)
-            
+
             # 发送 iOS 通知
             transcript_path = hook_data.get("transcript_path", "")
             if transcript_path:
@@ -427,17 +427,27 @@ def main():
                     send_ios_push_notification("任务完成", "Session 已结束")
             else:
                 send_ios_push_notification("任务完成", "Session 已结束")
-                
+
+        elif event_type == "PreToolUse":
+            tool_name = hook_data.get("tool_name", "")
+            if tool_name == "AskUserQuestion":
+                tool_input = hook_data.get("tool_input", {})
+                questions = tool_input.get("questions", [])
+                first_q = questions[0].get("question", "需要你回答") if questions else "需要你回答"
+                send_ios_push_notification("需要回答", first_q[:100])
+            else:
+                send_ios_push_notification("PreToolUse", f"{tool_name} 即将执行")
+
         # FIXME: 暂时关闭 iOS 通知，减少打扰
         # elif event_type == "Notification":
         #     # 处理通知事件
         #     message = format_notification_message(hook_data)
         #     send_ios_push_notification("Claude Code 通知", "收到新通知")
-            
+
         else:
             # 忽略其他事件类型（如 ToolUse 等）
             print(json.dumps({
-                "success": True, 
+                "success": True,
                 "message": f"忽略事件类型：{event_type}"
             }))
             sys.exit(0)
